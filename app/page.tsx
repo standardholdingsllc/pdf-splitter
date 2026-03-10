@@ -2,9 +2,11 @@
 
 import { useState, useCallback } from 'react'
 import { useDropzone } from 'react-dropzone'
+import { PDFDocument } from 'pdf-lib'
+import JSZip from 'jszip'
 import styles from './page.module.css'
 
-type Status = 'idle' | 'uploading' | 'processing' | 'success' | 'error'
+type Status = 'idle' | 'processing' | 'success' | 'error'
 
 export default function Home() {
   const [status, setStatus] = useState<Status>('idle')
@@ -12,55 +14,92 @@ export default function Home() {
   const [pageCount, setPageCount] = useState<number>(0)
   const [error, setError] = useState<string>('')
   const [progress, setProgress] = useState<number>(0)
+  const [progressText, setProgressText] = useState<string>('')
 
   const processFile = async (file: File) => {
     setFileName(file.name)
-    setStatus('uploading')
+    setStatus('processing')
     setError('')
     setProgress(0)
-
-    const formData = new FormData()
-    formData.append('pdf', file)
+    setProgressText('Reading PDF...')
 
     try {
-      // Simulate upload progress
-      const progressInterval = setInterval(() => {
-        setProgress(prev => Math.min(prev + 10, 90))
-      }, 100)
-
-      setStatus('processing')
+      // Read the file
+      const arrayBuffer = await file.arrayBuffer()
+      const pdfBytes = new Uint8Array(arrayBuffer)
       
-      const response = await fetch('/api/split', {
-        method: 'POST',
-        body: formData,
-      })
-
-      clearInterval(progressInterval)
-      setProgress(100)
-
-      if (!response.ok) {
-        const data = await response.json()
-        throw new Error(data.error || 'Failed to process PDF')
+      setProgress(10)
+      setProgressText('Loading PDF...')
+      
+      // Load the PDF
+      const pdfDoc = await PDFDocument.load(pdfBytes)
+      const totalPages = pdfDoc.getPageCount()
+      
+      if (totalPages === 0) {
+        throw new Error('PDF has no pages')
       }
 
-      const pages = parseInt(response.headers.get('X-Page-Count') || '0', 10)
-      setPageCount(pages)
+      setPageCount(totalPages)
+      setProgress(20)
+      setProgressText(`Splitting ${totalPages} pages...`)
 
+      const zip = new JSZip()
+      const baseName = file.name.replace(/\.pdf$/i, '')
+      
+      // Split each page into its own PDF
+      for (let i = 0; i < totalPages; i++) {
+        const newPdf = await PDFDocument.create()
+        const [copiedPage] = await newPdf.copyPages(pdfDoc, [i])
+        newPdf.addPage(copiedPage)
+        
+        const pageBytes = await newPdf.save()
+        const pageNumber = String(i + 1).padStart(String(totalPages).length, '0')
+        zip.file(`${baseName}_page_${pageNumber}.pdf`, pageBytes)
+        
+        // Update progress (20% to 80% for splitting)
+        const splitProgress = 20 + ((i + 1) / totalPages) * 60
+        setProgress(Math.round(splitProgress))
+        setProgressText(`Splitting page ${i + 1} of ${totalPages}...`)
+      }
+      
+      setProgress(85)
+      setProgressText('Creating zip file...')
+      
+      // Generate the zip
+      const zipBlob = await zip.generateAsync({ 
+        type: 'blob',
+        compression: 'DEFLATE',
+        compressionOptions: { level: 6 }
+      })
+      
+      setProgress(95)
+      setProgressText('Preparing download...')
+      
       // Download the zip file
-      const blob = await response.blob()
-      const url = window.URL.createObjectURL(blob)
+      const url = window.URL.createObjectURL(zipBlob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `${file.name.replace(/\.pdf$/i, '')}_pages.zip`
+      a.download = `${baseName}_pages.zip`
       document.body.appendChild(a)
       a.click()
       window.URL.revokeObjectURL(url)
       document.body.removeChild(a)
 
+      setProgress(100)
       setStatus('success')
     } catch (err) {
       setStatus('error')
-      setError(err instanceof Error ? err.message : 'An unexpected error occurred')
+      if (err instanceof Error) {
+        if (err.message.includes('encrypted') || err.message.includes('password')) {
+          setError('This PDF is password-protected and cannot be split.')
+        } else if (err.message.includes('Invalid PDF')) {
+          setError('This file appears to be corrupted or is not a valid PDF.')
+        } else {
+          setError(err.message)
+        }
+      } else {
+        setError('An unexpected error occurred')
+      }
     }
   }
 
@@ -75,7 +114,7 @@ export default function Home() {
     onDrop,
     accept: { 'application/pdf': ['.pdf'] },
     multiple: false,
-    disabled: status === 'uploading' || status === 'processing',
+    disabled: status === 'processing',
   })
 
   const reset = () => {
@@ -84,6 +123,7 @@ export default function Home() {
     setPageCount(0)
     setError('')
     setProgress(0)
+    setProgressText('')
   }
 
   return (
@@ -126,12 +166,12 @@ export default function Home() {
                 </p>
                 <span className={styles.dropzoneOr}>or</span>
                 <button className={styles.browseButton}>Browse Files</button>
-                <p className={styles.dropzoneHint}>PDF files only • Max 50MB</p>
+                <p className={styles.dropzoneHint}>PDF files only • No size limit</p>
               </div>
             </div>
           )}
 
-          {(status === 'uploading' || status === 'processing') && (
+          {status === 'processing' && (
             <div className={styles.processing}>
               <div className={styles.spinner}>
                 <svg viewBox="0 0 50 50">
@@ -139,9 +179,7 @@ export default function Home() {
                 </svg>
               </div>
               <p className={styles.processingFile}>{fileName}</p>
-              <p className={styles.processingStatus}>
-                {status === 'uploading' ? 'Uploading...' : 'Splitting pages...'}
-              </p>
+              <p className={styles.processingStatus}>{progressText}</p>
               <div className={styles.progressBar}>
                 <div 
                   className={styles.progressFill} 
@@ -187,7 +225,7 @@ export default function Home() {
         </div>
 
         <footer className={styles.footer}>
-          <p>Files are processed in your browser and on the server. Nothing is stored.</p>
+          <p>Files are processed entirely in your browser. Nothing is uploaded.</p>
         </footer>
       </div>
     </main>
